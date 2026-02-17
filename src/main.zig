@@ -665,20 +665,16 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     const all = [_][]const u8{"*"};
     const allowed: []const []const u8 = if (user_list.items.len > 0) user_list.items else &all;
 
-    // Determine API key for Anthropic
-    const api_key = config.api_key orelse blk: {
-        if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| {
-            break :blk key;
-        } else |_| {
-            std.debug.print("No API key. Set ANTHROPIC_API_KEY or add api_key to config.\n", .{});
-            std.process.exit(1);
-        }
-    };
+    if (config.api_key == null) {
+        std.debug.print("No API key in config. Add api_key to ~/.nullclaw/config.json\n", .{});
+        std.process.exit(1);
+    }
 
-    const model = config.default_model orelse "claude-sonnet-4-20250514";
+    const model = config.default_model orelse "anthropic/claude-3.5-sonnet";
     const temperature = config.default_temperature;
 
     std.debug.print("nullclaw telegram bot starting...\n", .{});
+    std.debug.print("  Provider: {s}\n", .{config.default_provider});
     std.debug.print("  Model: {s}\n", .{model});
     std.debug.print("  Temperature: {d:.1}\n", .{temperature});
     if (user_list.items.len == 0) {
@@ -693,8 +689,6 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
     var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed);
-    var anthropic = yc.providers.anthropic.AnthropicProvider.init(allocator, api_key, null);
-    var prov = anthropic.provider();
 
     // Bot loop: poll → think → reply
     while (true) {
@@ -707,14 +701,8 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         for (messages) |msg| {
             std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
 
-            // Call Anthropic
-            const reply = prov.chatWithSystem(
-                allocator,
-                "You are nullclaw, a helpful AI assistant. Be concise.",
-                msg.content,
-                model,
-                temperature,
-            ) catch |err| {
+            // Route to configured provider via complete()
+            const reply = yc.providers.complete(allocator, &config, msg.content) catch |err| {
                 std.debug.print("  LLM error: {}\n", .{err});
                 tg.sendMessage(msg.sender, "Sorry, I encountered an error.") catch {};
                 continue;

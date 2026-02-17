@@ -510,39 +510,29 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
     const body_str = try buildRequestBody(allocator, model, prompt, cfg.temperature, cfg.max_tokens);
     defer allocator.free(body_str);
 
-    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_header);
+    const auth_val = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    defer allocator.free(auth_val);
 
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
-    const uri = try std.Uri.parse(url);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer allocator.free(aw.writer.buffer);
 
-    var req = try client.request(.POST, uri, .{
-        .redirect_behavior = .unhandled,
-        .headers = .{
-            .authorization = .{ .override = auth_header },
-            .content_type = .{ .override = "application/json" },
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body_str,
+        .extra_headers = &.{
+            .{ .name = "Authorization", .value = auth_val },
+            .{ .name = "Content-Type", .value = "application/json" },
         },
+        .response_writer = &aw.writer,
     });
-    defer req.deinit();
 
-    const body_buf = try allocator.dupe(u8, body_str);
-    defer allocator.free(body_buf);
-    try req.sendBodyComplete(body_buf);
+    if (result.status != .ok) return error.ProviderError;
 
-    var redirect_buf: [4096]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-
-    if (response.head.status != .ok) {
-        return error.ProviderError;
-    }
-
-    var transfer_buf: [8192]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
-    const response_body = try reader.readAlloc(allocator, 1024 * 1024);
-    defer allocator.free(response_body);
-
+    const response_body = aw.writer.buffer[0..aw.writer.end];
     return try extractContent(allocator, response_body);
 }
 

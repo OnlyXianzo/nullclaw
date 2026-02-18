@@ -103,8 +103,31 @@ fn appendSkillsSection(
     w: anytype,
     workspace_dir: []const u8,
 ) !void {
-    const skill_list = skills_mod.listSkills(allocator, workspace_dir) catch return;
+    // Two-source loading: workspace skills + ~/.nullclaw/skills/community/
+    const home_dir = std.posix.getenv("HOME") orelse "";
+    const community_base = if (home_dir.len > 0)
+        std.fmt.allocPrint(allocator, "{s}/.nullclaw/skills", .{home_dir}) catch null
+    else
+        null;
+    defer if (community_base) |cb| allocator.free(cb);
+
+    // listSkillsMerged already calls checkRequirements on each skill.
+    // The fallback listSkills path needs explicit checkRequirements calls.
+    var used_merged = false;
+    const skill_list = if (community_base) |cb| blk: {
+        const merged = skills_mod.listSkillsMerged(allocator, cb, workspace_dir) catch
+            break :blk skills_mod.listSkills(allocator, workspace_dir) catch return;
+        used_merged = true;
+        break :blk merged;
+    } else skills_mod.listSkills(allocator, workspace_dir) catch return;
     defer skills_mod.freeSkills(allocator, skill_list);
+
+    // checkRequirements only needed for the non-merged path
+    if (!used_merged) {
+        for (skill_list) |*skill| {
+            skills_mod.checkRequirements(allocator, skill);
+        }
+    }
 
     if (skill_list.len == 0) return;
 
@@ -359,6 +382,152 @@ test "appendSkillsSection renders full instructions for always=true skill" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Always stage before committing.") != null);
     // Should NOT appear in summary XML
     try std.testing.expect(std.mem.indexOf(u8, output, "<available_skills>") == null);
+}
+
+test "appendSkillsSection renders mixed always=true and always=false" {
+    const allocator = std.testing.allocator;
+    const base = "/tmp/nullclaw-prompt-test-mixed";
+    const skills_dir = "/tmp/nullclaw-prompt-test-mixed/skills";
+
+    std.fs.makeDirAbsolute(base) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute(skills_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute("/tmp/nullclaw-prompt-test-mixed/skills/full-skill") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute("/tmp/nullclaw-prompt-test-mixed/skills/lazy-skill") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(base) catch {};
+
+    // always=true skill
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-mixed/skills/full-skill/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"full-skill\", \"description\": \"Full loader\", \"always\": true}");
+    }
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-mixed/skills/full-skill/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Full instructions here.");
+    }
+
+    // always=false skill (default)
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-mixed/skills/lazy-skill/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"lazy-skill\", \"description\": \"Lazy loader\"}");
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try appendSkillsSection(allocator, w, base);
+
+    const output = buf.items;
+    // Full skill should be in ## Skills section
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "### Skill: full-skill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Full instructions here.") != null);
+    // Lazy skill should be in <available_skills> XML
+    try std.testing.expect(std.mem.indexOf(u8, output, "<available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "name=\"lazy-skill\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "SKILL.md") != null);
+}
+
+test "appendSkillsSection renders unavailable skill with missing deps" {
+    const allocator = std.testing.allocator;
+    const base = "/tmp/nullclaw-prompt-test-unavail";
+    const skills_dir = "/tmp/nullclaw-prompt-test-unavail/skills";
+    const skill_dir = "/tmp/nullclaw-prompt-test-unavail/skills/docker-deploy";
+
+    std.fs.makeDirAbsolute(base) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute(skills_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute(skill_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(base) catch {};
+
+    // Skill requiring nonexistent binary and env
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-unavail/skills/docker-deploy/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"docker-deploy\", \"description\": \"Deploy with docker\", \"requires_bins\": [\"nullclaw_fake_docker_xyz\"], \"requires_env\": [\"NULLCLAW_FAKE_TOKEN_XYZ\"]}");
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try appendSkillsSection(allocator, w, base);
+
+    const output = buf.items;
+    // Should render as unavailable in XML
+    try std.testing.expect(std.mem.indexOf(u8, output, "<available_skills>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "name=\"docker-deploy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "available=\"false\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "missing=") != null);
+    // Should NOT be in the full Skills section
+    try std.testing.expect(std.mem.indexOf(u8, output, "## Skills") == null);
+}
+
+test "appendSkillsSection unavailable always=true skill renders in XML not full" {
+    const allocator = std.testing.allocator;
+    const base = "/tmp/nullclaw-prompt-test-unavail-always";
+    const skills_dir = "/tmp/nullclaw-prompt-test-unavail-always/skills";
+    const skill_dir = "/tmp/nullclaw-prompt-test-unavail-always/skills/broken-always";
+
+    std.fs.makeDirAbsolute(base) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute(skills_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute(skill_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(base) catch {};
+
+    // always=true but requires nonexistent binary → should be unavailable
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-unavail-always/skills/broken-always/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"broken-always\", \"description\": \"Broken always skill\", \"always\": true, \"requires_bins\": [\"nullclaw_nonexistent_xyz_aaa\"]}");
+    }
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-prompt-test-unavail-always/skills/broken-always/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("These instructions should NOT appear in prompt.");
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try appendSkillsSection(allocator, w, base);
+
+    const output = buf.items;
+    // Even though always=true, since unavailable it should render as XML summary
+    try std.testing.expect(std.mem.indexOf(u8, output, "available=\"false\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "name=\"broken-always\"") != null);
+    // Full instructions should NOT be in the prompt
+    try std.testing.expect(std.mem.indexOf(u8, output, "These instructions should NOT appear in prompt.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "### Skill: broken-always") == null);
 }
 
 test "buildSystemPrompt datetime appears before runtime" {

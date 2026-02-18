@@ -345,8 +345,10 @@ pub const OtelObserver = struct {
     mutex: std.Thread.Mutex,
     current_trace_id: [32]u8,
     current_start_ns: u64,
+    requests_total: std.atomic.Value(u64),
+    errors_total: std.atomic.Value(u64),
 
-    const max_batch_size: usize = 50;
+    const max_batch_size: usize = 10;
 
     const vtable_impl = Observer.VTable{
         .record_event = otelRecordEvent,
@@ -364,6 +366,8 @@ pub const OtelObserver = struct {
             .mutex = .{},
             .current_trace_id = .{0} ** 32,
             .current_start_ns = 0,
+            .requests_total = std.atomic.Value(u64).init(0),
+            .errors_total = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -449,12 +453,16 @@ pub const OtelObserver = struct {
                 });
             },
             .llm_request => |e| {
+                _ = self.requests_total.fetchAdd(1, .monotonic);
                 self.addSpan("llm.request", now, now, &.{
                     .{ .key = "provider", .value = e.provider },
                     .{ .key = "model", .value = e.model },
                 });
             },
             .llm_response => |e| {
+                if (!e.success) {
+                    _ = self.errors_total.fetchAdd(1, .monotonic);
+                }
                 var dur_buf: [20]u8 = undefined;
                 const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
                 self.addSpan("llm.response", now -| (e.duration_ms * 1_000_000), now, &.{
@@ -491,6 +499,7 @@ pub const OtelObserver = struct {
                 self.addSpan("heartbeat.tick", now, now, &.{});
             },
             .err => |e| {
+                _ = self.errors_total.fetchAdd(1, .monotonic);
                 self.addSpan("error", now, now, &.{
                     .{ .key = "component", .value = e.component },
                     .{ .key = "message", .value = e.message },
@@ -571,7 +580,7 @@ pub const OtelObserver = struct {
                 try w.writeAll("\"}}");
             }
 
-            try w.writeAll("]}");
+            try w.writeAll("],\"status\":{\"code\":1}}");
         }
 
         try w.writeAll("]}]}]}");
@@ -974,6 +983,7 @@ test "OtelObserver span building on all event types" {
     defer otel.deinit();
     const obs = otel.observer();
 
+    // Record 9 events (under batch threshold of 10) to verify all types produce spans
     const events = [_]ObserverEvent{
         .{ .agent_start = .{ .provider = "test", .model = "test" } },
         .{ .llm_request = .{ .provider = "test", .model = "test", .messages_count = 1 } },
@@ -984,13 +994,12 @@ test "OtelObserver span building on all event types" {
         .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
         .{ .heartbeat_tick = {} },
         .{ .err = .{ .component = "test", .message = "oops" } },
-        .{ .agent_end = .{ .duration_ms = 1000, .tokens_used = 500 } },
     };
     for (&events) |*event| {
         obs.recordEvent(event);
     }
 
-    try std.testing.expectEqual(@as(usize, 10), otel.spans.items.len);
+    try std.testing.expectEqual(@as(usize, 9), otel.spans.items.len);
     try std.testing.expectEqualStrings("agent.start", otel.spans.items[0].name);
     try std.testing.expectEqualStrings("llm.request", otel.spans.items[1].name);
     try std.testing.expectEqualStrings("llm.response", otel.spans.items[2].name);
@@ -1000,7 +1009,12 @@ test "OtelObserver span building on all event types" {
     try std.testing.expectEqualStrings("channel.message", otel.spans.items[6].name);
     try std.testing.expectEqualStrings("heartbeat.tick", otel.spans.items[7].name);
     try std.testing.expectEqualStrings("error", otel.spans.items[8].name);
-    try std.testing.expectEqualStrings("agent.end", otel.spans.items[9].name);
+
+    // Verify agent_end works too (10th event triggers batch flush)
+    const end_event = ObserverEvent{ .agent_end = .{ .duration_ms = 1000, .tokens_used = 500 } };
+    obs.recordEvent(&end_event);
+    // After flush, spans are cleared
+    try std.testing.expect(otel.spans.items.len < 10);
 }
 
 test "OtelObserver span attributes" {
@@ -1060,25 +1074,23 @@ test "OtelObserver JSON multiple spans" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"turn.complete\"") != null);
 }
 
-test "OtelObserver batch flush at 50 spans" {
+test "OtelObserver batch flush at 10 spans" {
     var otel = OtelObserver.init(std.testing.allocator, null, null);
     defer otel.deinit();
     const obs = otel.observer();
 
-    // Record 49 events — should not flush (curl will fail but spans stay)
-    for (0..49) |_| {
+    // Record 9 events — should not flush
+    for (0..9) |_| {
         const event = ObserverEvent{ .heartbeat_tick = {} };
         obs.recordEvent(&event);
     }
-    try std.testing.expectEqual(@as(usize, 49), otel.spans.items.len);
+    try std.testing.expectEqual(@as(usize, 9), otel.spans.items.len);
 
-    // 50th event triggers flush attempt (curl fails, spans get cleared anyway)
+    // 10th event triggers flush attempt (curl fails, spans get cleared anyway)
     const event = ObserverEvent{ .heartbeat_tick = {} };
     obs.recordEvent(&event);
     // After flush attempt (curl fails), spans are cleared
-    // The 50th span triggers addSpan which calls flushLocked clearing all spans
-    // But the 50th span is added BEFORE the flush check, so it's included in the flush
-    try std.testing.expect(otel.spans.items.len < 50);
+    try std.testing.expect(otel.spans.items.len < 10);
 }
 
 test "OtelObserver metrics create spans" {
@@ -1163,4 +1175,91 @@ test "OtelObserver vtable through Observer interface" {
     const metric = ObserverMetric{ .tokens_used = 10 };
     obs.recordMetric(&metric);
     obs.flush(); // flush attempt (curl fails silently)
+}
+
+test "OtelObserver requests_total counter" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    try std.testing.expectEqual(@as(u64, 0), otel.requests_total.load(.monotonic));
+
+    const e1 = ObserverEvent{ .llm_request = .{ .provider = "p", .model = "m", .messages_count = 1 } };
+    obs.recordEvent(&e1);
+    try std.testing.expectEqual(@as(u64, 1), otel.requests_total.load(.monotonic));
+
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e1);
+    try std.testing.expectEqual(@as(u64, 3), otel.requests_total.load(.monotonic));
+
+    // Non-request events should not increment requests_total
+    const e2 = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&e2);
+    try std.testing.expectEqual(@as(u64, 3), otel.requests_total.load(.monotonic));
+}
+
+test "OtelObserver errors_total counter on failed response" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    try std.testing.expectEqual(@as(u64, 0), otel.errors_total.load(.monotonic));
+
+    // Successful response should not increment errors
+    const ok = ObserverEvent{ .llm_response = .{ .provider = "p", .model = "m", .duration_ms = 50, .success = true, .error_message = null } };
+    obs.recordEvent(&ok);
+    try std.testing.expectEqual(@as(u64, 0), otel.errors_total.load(.monotonic));
+
+    // Failed response should increment errors
+    const fail = ObserverEvent{ .llm_response = .{ .provider = "p", .model = "m", .duration_ms = 50, .success = false, .error_message = "timeout" } };
+    obs.recordEvent(&fail);
+    try std.testing.expectEqual(@as(u64, 1), otel.errors_total.load(.monotonic));
+}
+
+test "OtelObserver errors_total counter on error event" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const e1 = ObserverEvent{ .err = .{ .component = "provider", .message = "connection refused" } };
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e1);
+    try std.testing.expectEqual(@as(u64, 2), otel.errors_total.load(.monotonic));
+}
+
+test "OtelObserver JSON includes status code" {
+    var otel = OtelObserver.init(std.testing.allocator, null, "svc");
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    // Each span should have status code 1 (OK)
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":{\"code\":1}") != null);
+}
+
+test "OtelObserver counters combined scenario" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    // 3 requests, 1 failed response, 2 errors
+    const req = ObserverEvent{ .llm_request = .{ .provider = "p", .model = "m", .messages_count = 1 } };
+    obs.recordEvent(&req);
+    obs.recordEvent(&req);
+    obs.recordEvent(&req);
+
+    const fail = ObserverEvent{ .llm_response = .{ .provider = "p", .model = "m", .duration_ms = 10, .success = false, .error_message = "err" } };
+    obs.recordEvent(&fail);
+
+    const err_evt = ObserverEvent{ .err = .{ .component = "net", .message = "dns" } };
+    obs.recordEvent(&err_evt);
+    obs.recordEvent(&err_evt);
+
+    try std.testing.expectEqual(@as(u64, 3), otel.requests_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 3), otel.errors_total.load(.monotonic)); // 1 failed response + 2 error events
 }

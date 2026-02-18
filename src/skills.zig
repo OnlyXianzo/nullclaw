@@ -682,6 +682,126 @@ pub fn mergeCommunitySkills(allocator: std.mem.Allocator, workspace_skills: []Sk
     return try merged.toOwnedSlice(allocator);
 }
 
+// ── Sync Result API ─────────────────────────────────────────────
+
+pub const SyncResult = struct {
+    synced: bool,
+    skills_count: u32,
+    message: []u8,
+};
+
+/// Count .md files in a directory (non-recursive).
+fn countMdFiles(dir_path: []const u8) u32 {
+    const dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return 0;
+    var dir_mut = dir;
+    defer dir_mut.close();
+
+    var count: u32 = 0;
+    var it = dir_mut.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".md")) count += 1;
+    }
+    return count;
+}
+
+/// Synchronize community skills and return a result struct with sync status.
+/// This wraps syncCommunitySkills with additional information about the outcome.
+pub fn syncCommunitySkillsResult(allocator: std.mem.Allocator, workspace_dir: []const u8) !SyncResult {
+    // Check if enabled via env var
+    const enabled_env = std.posix.getenv("NULLCLAW_OPEN_SKILLS_ENABLED");
+    if (enabled_env == null) {
+        return SyncResult{
+            .synced = false,
+            .skills_count = 0,
+            .message = try allocator.dupe(u8, "community skills sync disabled (env not set)"),
+        };
+    }
+    if (std.mem.eql(u8, enabled_env.?, "false")) {
+        return SyncResult{
+            .synced = false,
+            .skills_count = 0,
+            .message = try allocator.dupe(u8, "community skills sync disabled"),
+        };
+    }
+
+    // Determine community skills directory
+    const community_dir = blk: {
+        if (std.posix.getenv("NULLCLAW_OPEN_SKILLS_DIR")) |dir| {
+            break :blk try allocator.dupe(u8, dir);
+        }
+        break :blk try std.fmt.allocPrint(allocator, "{s}/skills/community", .{workspace_dir});
+    };
+    defer allocator.free(community_dir);
+
+    // Marker file path
+    const marker_path = try std.fmt.allocPrint(allocator, "{s}/state/skills_sync.json", .{workspace_dir});
+    defer allocator.free(marker_path);
+
+    // Check if sync is needed (7-day interval)
+    const now = std.time.timestamp();
+    const interval: i64 = @intCast(COMMUNITY_SYNC_INTERVAL_DAYS * 24 * 3600);
+    var marker_buf: [256]u8 = undefined;
+    if (readSyncMarker(marker_path, &marker_buf)) |last_sync| {
+        if (now - last_sync < interval) {
+            const count = countMdFiles(community_dir);
+            return SyncResult{
+                .synced = false,
+                .skills_count = count,
+                .message = try allocator.dupe(u8, "sync skipped, still fresh"),
+            };
+        }
+    }
+
+    // Determine if community_dir exists
+    const dir_exists = blk: {
+        std.fs.accessAbsolute(community_dir, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (!dir_exists) {
+        _ = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "git", "clone", "--depth", "1", OPEN_SKILLS_REPO_URL, community_dir },
+            .max_output_bytes = 8192,
+        }) catch {
+            return SyncResult{
+                .synced = false,
+                .skills_count = 0,
+                .message = try allocator.dupe(u8, "git clone failed"),
+            };
+        };
+    } else {
+        _ = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "git", "-C", community_dir, "pull", "--ff-only" },
+            .max_output_bytes = 8192,
+        }) catch {
+            const count = countMdFiles(community_dir);
+            return SyncResult{
+                .synced = false,
+                .skills_count = count,
+                .message = try allocator.dupe(u8, "git pull failed"),
+            };
+        };
+    }
+
+    // Update marker
+    writeSyncMarker(allocator, marker_path) catch {};
+
+    const count = countMdFiles(community_dir);
+    return SyncResult{
+        .synced = true,
+        .skills_count = count,
+        .message = try std.fmt.allocPrint(allocator, "synced {d} community skills", .{count}),
+    };
+}
+
+/// Free a SyncResult's heap-allocated message.
+pub fn freeSyncResult(allocator: std.mem.Allocator, result: *const SyncResult) void {
+    allocator.free(result.message);
+}
+
 // ── Tests ───────────────────────────────────────────────────────
 
 test "parseManifest full JSON" {
@@ -1545,4 +1665,147 @@ test "listSkillsMerged with nonexistent dirs returns empty" {
     const skills = try listSkillsMerged(allocator, "/tmp/nullclaw-nonexistent-a", "/tmp/nullclaw-nonexistent-b");
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 0), skills.len);
+}
+
+test "checkRequirements detects missing binary" {
+    const allocator = std.testing.allocator;
+    const bin_arr = try allocator.alloc([]const u8, 1);
+    bin_arr[0] = try allocator.dupe(u8, "nullclaw_nonexistent_xyz_bin");
+    var skill = Skill{
+        .name = "needs-bin",
+        .requires_bins = bin_arr,
+    };
+    checkRequirements(allocator, &skill);
+    defer if (skill.missing_deps.len > 0) allocator.free(skill.missing_deps);
+    defer freeStringArray(allocator, skill.requires_bins);
+
+    try std.testing.expect(!skill.available);
+    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "bin:nullclaw_nonexistent_xyz_bin") != null);
+}
+
+test "checkRequirements detects both missing bin and env" {
+    const allocator = std.testing.allocator;
+    const bin_arr = try allocator.alloc([]const u8, 1);
+    bin_arr[0] = try allocator.dupe(u8, "nullclaw_missing_bin_abc");
+    const env_arr = try allocator.alloc([]const u8, 1);
+    env_arr[0] = try allocator.dupe(u8, "NULLCLAW_MISSING_ENV_ABC");
+    var skill = Skill{
+        .name = "needs-both",
+        .requires_bins = bin_arr,
+        .requires_env = env_arr,
+    };
+    checkRequirements(allocator, &skill);
+    defer if (skill.missing_deps.len > 0) allocator.free(skill.missing_deps);
+    defer freeStringArray(allocator, skill.requires_bins);
+    defer freeStringArray(allocator, skill.requires_env);
+
+    try std.testing.expect(!skill.available);
+    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "bin:nullclaw_missing_bin_abc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill.missing_deps, "env:NULLCLAW_MISSING_ENV_ABC") != null);
+}
+
+test "listSkillsMerged runs checkRequirements" {
+    const allocator = std.testing.allocator;
+    const builtin_base = "/tmp/nullclaw-test-merge-checkreq";
+    const ws_base = "/tmp/nullclaw-test-merge-checkreq-ws";
+
+    // Setup builtin with a skill that requires a nonexistent binary
+    std.fs.makeDirAbsolute(builtin_base) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute("/tmp/nullclaw-test-merge-checkreq/skills") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    std.fs.makeDirAbsolute("/tmp/nullclaw-test-merge-checkreq/skills/needy") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(builtin_base) catch {};
+
+    {
+        const f = try std.fs.createFileAbsolute("/tmp/nullclaw-test-merge-checkreq/skills/needy/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"needy\", \"description\": \"needs stuff\", \"requires_bins\": [\"nullclaw_fake_bin_zzz\"]}");
+    }
+
+    // Empty workspace
+    std.fs.makeDirAbsolute(ws_base) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(ws_base) catch {};
+
+    const skills = try listSkillsMerged(allocator, builtin_base, ws_base);
+    defer freeSkills(allocator, skills);
+
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    // checkRequirements should have been called by listSkillsMerged
+    try std.testing.expect(!skills[0].available);
+    try std.testing.expect(std.mem.indexOf(u8, skills[0].missing_deps, "bin:nullclaw_fake_bin_zzz") != null);
+}
+
+// ── SyncResult API Tests ────────────────────────────────────────
+
+test "SyncResult struct fields" {
+    const allocator = std.testing.allocator;
+    const msg = try allocator.dupe(u8, "test message");
+    const result = SyncResult{
+        .synced = true,
+        .skills_count = 42,
+        .message = msg,
+    };
+    defer freeSyncResult(allocator, &result);
+
+    try std.testing.expect(result.synced);
+    try std.testing.expectEqual(@as(u32, 42), result.skills_count);
+    try std.testing.expectEqualStrings("test message", result.message);
+}
+
+test "syncCommunitySkillsResult disabled when env not set" {
+    // NULLCLAW_OPEN_SKILLS_ENABLED is not set in test environment
+    const allocator = std.testing.allocator;
+    const result = try syncCommunitySkillsResult(allocator, "/tmp/nullclaw-test-sync-result-disabled");
+    defer freeSyncResult(allocator, &result);
+
+    try std.testing.expect(!result.synced);
+    try std.testing.expectEqual(@as(u32, 0), result.skills_count);
+    try std.testing.expectEqualStrings("community skills sync disabled (env not set)", result.message);
+}
+
+test "countMdFiles returns zero for nonexistent dir" {
+    const count = countMdFiles("/tmp/nullclaw-test-countmd-nonexistent");
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "countMdFiles counts only .md files" {
+    const dir = "/tmp/nullclaw-test-countmd";
+
+    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer std.fs.deleteTreeAbsolute(dir) catch {};
+
+    // Create 3 .md files and 2 non-.md files
+    inline for (.{ "a.md", "b.md", "c.md", "readme.txt", "data.json" }) |name| {
+        const f = try std.fs.createFileAbsolute(dir ++ "/" ++ name, .{});
+        f.close();
+    }
+
+    const count = countMdFiles(dir);
+    try std.testing.expectEqual(@as(u32, 3), count);
+}
+
+test "freeSyncResult frees message" {
+    const allocator = std.testing.allocator;
+    const msg = try allocator.dupe(u8, "allocated message");
+    const result = SyncResult{
+        .synced = false,
+        .skills_count = 0,
+        .message = msg,
+    };
+    // freeSyncResult should not leak — testing allocator will catch leaks
+    freeSyncResult(allocator, &result);
 }

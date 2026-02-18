@@ -48,6 +48,9 @@ pub const runtime = @import("runtime.zig");
 pub const mcp = @import("mcp.zig");
 pub const subagent = @import("subagent.zig");
 
+// Phase 4c: Auth
+pub const auth = @import("auth.zig");
+
 // Phase 5: Hardware & Integrations
 pub const hardware = @import("hardware.zig");
 pub const integrations = @import("integrations.zig");
@@ -55,6 +58,7 @@ pub const peripherals = @import("peripherals.zig");
 pub const rag = @import("rag.zig");
 pub const skillforge = @import("skillforge.zig");
 pub const tunnel = @import("tunnel.zig");
+pub const voice = @import("voice.zig");
 
 test {
     // Run tests from all imported modules

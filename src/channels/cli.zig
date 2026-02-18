@@ -92,7 +92,7 @@ pub const CliChannel = struct {
 // History — persistent REPL command history (~/.nullclaw_history)
 // ═══════════════════════════════════════════════════════════════════════════
 
-const MAX_HISTORY_LINES: usize = 1000;
+const MAX_HISTORY_LINES: usize = 500;
 
 /// Load command history from a file (one command per line).
 /// Returns up to MAX_HISTORY_LINES most recent entries.
@@ -126,12 +126,16 @@ pub fn loadHistory(allocator: std.mem.Allocator, path: []const u8) ![][]const u8
                 const segment = data[start..i];
                 if (carry.items.len > 0) {
                     try carry.appendSlice(allocator, segment);
-                    if (carry.items.len > 0) {
-                        try lines.append(allocator, try allocator.dupe(u8, carry.items));
+                    const trimmed = std.mem.trim(u8, carry.items, " \t\r");
+                    if (trimmed.len > 0) {
+                        try lines.append(allocator, try allocator.dupe(u8, trimmed));
                     }
                     carry.clearRetainingCapacity();
-                } else if (segment.len > 0) {
-                    try lines.append(allocator, try allocator.dupe(u8, segment));
+                } else {
+                    const trimmed = std.mem.trim(u8, segment, " \t\r");
+                    if (trimmed.len > 0) {
+                        try lines.append(allocator, try allocator.dupe(u8, trimmed));
+                    }
                 }
                 start = i + 1;
             }
@@ -144,7 +148,10 @@ pub fn loadHistory(allocator: std.mem.Allocator, path: []const u8) ![][]const u8
 
     // Trailing content without final newline
     if (carry.items.len > 0) {
-        try lines.append(allocator, try allocator.dupe(u8, carry.items));
+        const trimmed = std.mem.trim(u8, carry.items, " \t\r");
+        if (trimmed.len > 0) {
+            try lines.append(allocator, try allocator.dupe(u8, trimmed));
+        }
     }
 
     // Keep only the most recent MAX_HISTORY_LINES
@@ -263,4 +270,72 @@ test "saveHistory and loadHistory roundtrip" {
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
     try std.testing.expectEqualStrings("alpha", loaded[0]);
     try std.testing.expectEqualStrings("beta", loaded[1]);
+}
+
+test "loadHistory trims whitespace from entries" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/nullclaw_test_trim_history";
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("  hello  \n\t world \t\nfoo\r\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const history = try loadHistory(allocator, tmp_path);
+    defer freeHistory(allocator, history);
+
+    try std.testing.expectEqual(@as(usize, 3), history.len);
+    try std.testing.expectEqualStrings("hello", history[0]);
+    try std.testing.expectEqualStrings("world", history[1]);
+    try std.testing.expectEqualStrings("foo", history[2]);
+}
+
+test "loadHistory skips blank lines" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/nullclaw_test_blank_history";
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("first\n\n   \n\nsecond\n  \nthird\n");
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const history = try loadHistory(allocator, tmp_path);
+    defer freeHistory(allocator, history);
+
+    try std.testing.expectEqual(@as(usize, 3), history.len);
+    try std.testing.expectEqualStrings("first", history[0]);
+    try std.testing.expectEqualStrings("second", history[1]);
+    try std.testing.expectEqualStrings("third", history[2]);
+}
+
+test "loadHistory enforces max entries limit" {
+    const allocator = std.testing.allocator;
+    const tmp_path = "/tmp/nullclaw_test_max_history";
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        defer f.close();
+        // Write more than MAX_HISTORY_LINES (500) entries
+        for (0..600) |i| {
+            var buf: [32]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "cmd-{d}\n", .{i}) catch unreachable;
+            f.writeAll(line) catch break;
+        }
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const history = try loadHistory(allocator, tmp_path);
+    defer freeHistory(allocator, history);
+
+    // Should be capped at MAX_HISTORY_LINES (500)
+    try std.testing.expectEqual(@as(usize, MAX_HISTORY_LINES), history.len);
+    // First entry should be cmd-100 (600 - 500 = 100 oldest dropped)
+    try std.testing.expectEqualStrings("cmd-100", history[0]);
+    // Last entry should be cmd-599
+    try std.testing.expectEqualStrings("cmd-599", history[history.len - 1]);
+}
+
+test "MAX_HISTORY_LINES is 500" {
+    try std.testing.expectEqual(@as(usize, 500), MAX_HISTORY_LINES);
 }

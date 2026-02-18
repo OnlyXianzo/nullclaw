@@ -15,11 +15,11 @@ const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
 
-const c = @cImport({
+pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
-const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+pub const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 
 pub const SqliteMemory = struct {
     db: ?*c.sqlite3,

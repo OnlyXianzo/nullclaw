@@ -6,20 +6,18 @@ const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const ChatMessage = root.ChatMessage;
 
-/// Provider that delegates to the `claude` CLI (Claude Code).
+/// Provider that delegates to the `codex` CLI (OpenAI Codex).
 ///
-/// Runs `claude -p <prompt> --output-format stream-json --model <model>`
-/// and parses the stream-json output for a `type: "result"` event.
-pub const ClaudeCliProvider = struct {
+/// Runs `codex --quiet <prompt>` and reads stdout as plain text.
+pub const CodexCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
 
-    const DEFAULT_MODEL = "claude-opus-4-6";
-    const CLI_NAME = "claude";
+    const DEFAULT_MODEL = "codex-mini-latest";
+    const CLI_NAME = "codex";
     const TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
 
-    pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !ClaudeCliProvider {
-        // Verify CLI is in PATH
+    pub fn init(allocator: std.mem.Allocator, model: ?[]const u8) !CodexCliProvider {
         try checkCliAvailable(allocator, CLI_NAME);
         return .{
             .allocator = allocator,
@@ -28,7 +26,7 @@ pub const ClaudeCliProvider = struct {
     }
 
     /// Create a Provider vtable interface.
-    pub fn provider(self: *ClaudeCliProvider) Provider {
+    pub fn provider(self: *CodexCliProvider) Provider {
         return .{
             .ptr = @ptrCast(self),
             .vtable = &vtable,
@@ -44,40 +42,32 @@ pub const ClaudeCliProvider = struct {
     };
 
     fn chatWithSystemImpl(
-        ptr: *anyopaque,
+        _: *anyopaque,
         allocator: std.mem.Allocator,
         system_prompt: ?[]const u8,
         message: []const u8,
-        model: []const u8,
+        _: []const u8,
         _: f64,
     ) anyerror![]const u8 {
-        const self: *ClaudeCliProvider = @ptrCast(@alignCast(ptr));
-        const effective_model = if (model.len > 0) model else self.model;
-
-        // Combine system prompt with message if provided
         const prompt = if (system_prompt) |sys|
             try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ sys, message })
         else
             try allocator.dupe(u8, message);
         defer allocator.free(prompt);
 
-        return runClaude(allocator, prompt, effective_model);
+        return runCodex(allocator, prompt);
     }
 
     fn chatImpl(
-        ptr: *anyopaque,
+        _: *anyopaque,
         allocator: std.mem.Allocator,
         request: ChatRequest,
-        model: []const u8,
+        _: []const u8,
         _: f64,
     ) anyerror!ChatResponse {
-        const self: *ClaudeCliProvider = @ptrCast(@alignCast(ptr));
-        const effective_model = if (model.len > 0) model else self.model;
-
-        // Extract last user message as prompt
         const prompt = extractLastUserMessage(request.messages) orelse return error.NoUserMessage;
-        const content = try runClaude(allocator, prompt, effective_model);
-        return ChatResponse{ .content = content, .model = effective_model };
+        const content = try runCodex(allocator, prompt);
+        return ChatResponse{ .content = content, .model = "codex-cli" };
     }
 
     fn supportsNativeToolsImpl(_: *anyopaque) bool {
@@ -85,21 +75,17 @@ pub const ClaudeCliProvider = struct {
     }
 
     fn getNameImpl(_: *anyopaque) []const u8 {
-        return "claude-cli";
+        return "codex-cli";
     }
 
     fn deinitImpl(_: *anyopaque) void {}
 
-    /// Run the claude CLI and parse stream-json output.
-    fn runClaude(allocator: std.mem.Allocator, prompt: []const u8, model: []const u8) ![]const u8 {
+    /// Run the codex CLI and return stdout as plain text.
+    fn runCodex(allocator: std.mem.Allocator, prompt: []const u8) ![]const u8 {
         const argv = [_][]const u8{
             CLI_NAME,
-            "-p",
+            "--quiet",
             prompt,
-            "--output-format",
-            "stream-json",
-            "--model",
-            model,
         };
 
         var child = std.process.Child.init(&argv, allocator);
@@ -108,53 +94,37 @@ pub const ClaudeCliProvider = struct {
 
         try child.spawn();
 
-        // Read all stdout
-        const max_output: usize = 4 * 1024 * 1024; // 4 MB
+        const max_output: usize = 4 * 1024 * 1024;
         const stdout_result = child.stdout.?.readToEndAlloc(allocator, max_output) catch |err| {
             _ = child.wait() catch {};
             return err;
         };
-        defer allocator.free(stdout_result);
 
         const term = try child.wait();
         switch (term) {
             .Exited => |code| {
-                if (code != 0) return error.CliProcessFailed;
-            },
-            else => return error.CliProcessFailed,
-        }
-
-        // Parse stream-json: each line is a JSON object, find type="result"
-        return parseStreamJson(allocator, stdout_result);
-    }
-
-    /// Parse claude stream-json output lines for a result event.
-    fn parseStreamJson(allocator: std.mem.Allocator, output: []const u8) ![]const u8 {
-        var lines = std.mem.splitScalar(u8, output, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-            defer parsed.deinit();
-
-            if (parsed.value != .object) continue;
-            const obj = parsed.value.object;
-
-            // Look for type: "result"
-            if (obj.get("type")) |type_val| {
-                if (type_val == .string and std.mem.eql(u8, type_val.string, "result")) {
-                    if (obj.get("result")) |result_val| {
-                        if (result_val == .string) {
-                            return try allocator.dupe(u8, result_val.string);
-                        }
-                    }
+                if (code != 0) {
+                    allocator.free(stdout_result);
+                    return error.CliProcessFailed;
                 }
-            }
+            },
+            else => {
+                allocator.free(stdout_result);
+                return error.CliProcessFailed;
+            },
         }
-        return error.NoResultInOutput;
+
+        // Trim trailing whitespace
+        const trimmed = std.mem.trimRight(u8, stdout_result, " \t\r\n");
+        if (trimmed.len == stdout_result.len) {
+            return stdout_result;
+        }
+        const duped = try allocator.dupe(u8, trimmed);
+        allocator.free(stdout_result);
+        return duped;
     }
 
-    /// Health check: run `claude --version` and verify exit code 0.
+    /// Health check: run `codex --version` and verify exit code 0.
     pub fn healthCheck(allocator: std.mem.Allocator) !void {
         try checkCliVersion(allocator, CLI_NAME);
     }
@@ -220,10 +190,28 @@ fn extractLastUserMessage(messages: []const ChatMessage) ?[]const u8 {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "ClaudeCliProvider.getNameImpl returns claude-cli" {
-    const vtable = ClaudeCliProvider.vtable;
+test "CodexCliProvider.getNameImpl returns codex-cli" {
+    const vtable = CodexCliProvider.vtable;
     var dummy: u8 = 0;
-    try std.testing.expectEqualStrings("claude-cli", vtable.getName(@ptrCast(&dummy)));
+    try std.testing.expectEqualStrings("codex-cli", vtable.getName(@ptrCast(&dummy)));
+}
+
+test "CodexCliProvider vtable has correct function pointers" {
+    const vtable = CodexCliProvider.vtable;
+    var dummy: u8 = 0;
+    try std.testing.expectEqualStrings("codex-cli", vtable.getName(@ptrCast(&dummy)));
+    try std.testing.expect(!vtable.supportsNativeTools(@ptrCast(&dummy)));
+}
+
+test "CodexCliProvider supportsNativeTools returns false" {
+    const vtable = CodexCliProvider.vtable;
+    var dummy: u8 = 0;
+    try std.testing.expect(!vtable.supportsNativeTools(@ptrCast(&dummy)));
+}
+
+test "CodexCliProvider checkCliAvailable returns CliNotFound for missing binary" {
+    const result = checkCliAvailable(std.testing.allocator, "nonexistent_binary_xyzzy_codex_99999");
+    try std.testing.expectError(error.CliNotFound, result);
 }
 
 test "extractLastUserMessage finds last user" {
@@ -250,61 +238,6 @@ test "extractLastUserMessage empty messages" {
     try std.testing.expect(extractLastUserMessage(&msgs) == null);
 }
 
-test "parseStreamJson extracts result" {
-    const input =
-        \\{"type":"start","session_id":"abc123"}
-        \\{"type":"content","content":"partial"}
-        \\{"type":"result","result":"Hello from Claude CLI!"}
-    ;
-    const result = try ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("Hello from Claude CLI!", result);
-}
-
-test "parseStreamJson no result returns error" {
-    const input =
-        \\{"type":"start","session_id":"abc123"}
-        \\{"type":"content","content":"partial"}
-    ;
-    const result = ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
-    try std.testing.expectError(error.NoResultInOutput, result);
-}
-
-test "parseStreamJson handles empty input" {
-    const result = ClaudeCliProvider.parseStreamJson(std.testing.allocator, "");
-    try std.testing.expectError(error.NoResultInOutput, result);
-}
-
-test "parseStreamJson handles invalid json lines gracefully" {
-    const input =
-        \\not json at all
-        \\{"type":"result","result":"found it"}
-    ;
-    const result = try ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("found it", result);
-}
-
-test "parseStreamJson skips result with non-string value" {
-    const input =
-        \\{"type":"result","result":42}
-    ;
-    const result = ClaudeCliProvider.parseStreamJson(std.testing.allocator, input);
-    try std.testing.expectError(error.NoResultInOutput, result);
-}
-
-test "ClaudeCliProvider vtable has correct function pointers" {
-    const vtable = ClaudeCliProvider.vtable;
-    var dummy: u8 = 0;
-    try std.testing.expectEqualStrings("claude-cli", vtable.getName(@ptrCast(&dummy)));
-    try std.testing.expect(!vtable.supportsNativeTools(@ptrCast(&dummy)));
-}
-
-test "ClaudeCliProvider.init returns CliNotFound for missing binary" {
-    const result = checkCliAvailable(std.testing.allocator, "nonexistent_binary_xyzzy_12345");
-    try std.testing.expectError(error.CliNotFound, result);
-}
-
-test "ClaudeCliProvider default model is claude-opus-4-6" {
-    try std.testing.expectEqualStrings("claude-opus-4-6", ClaudeCliProvider.DEFAULT_MODEL);
+test "CodexCliProvider default model is codex-mini-latest" {
+    try std.testing.expectEqualStrings("codex-mini-latest", CodexCliProvider.DEFAULT_MODEL);
 }

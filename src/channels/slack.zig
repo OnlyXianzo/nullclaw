@@ -12,6 +12,7 @@ pub const SlackChannel = struct {
     allowed_users: []const []const u8,
     last_ts: []const u8,
     thread_ts: ?[]const u8 = null,
+    policy: root.ChannelPolicy = .{},
 
     pub const API_BASE = "https://slack.com/api";
 
@@ -29,6 +30,25 @@ pub const SlackChannel = struct {
             .channel_id = channel_id,
             .allowed_users = allowed_users,
             .last_ts = "0",
+        };
+    }
+
+    pub fn initWithPolicy(
+        allocator: std.mem.Allocator,
+        bot_token: []const u8,
+        app_token: ?[]const u8,
+        channel_id: ?[]const u8,
+        allowed_users: []const []const u8,
+        policy: root.ChannelPolicy,
+    ) SlackChannel {
+        return .{
+            .allocator = allocator,
+            .bot_token = bot_token,
+            .app_token = app_token,
+            .channel_id = channel_id,
+            .allowed_users = allowed_users,
+            .last_ts = "0",
+            .policy = policy,
         };
     }
 
@@ -53,6 +73,16 @@ pub const SlackChannel = struct {
 
     pub fn isUserAllowed(self: *const SlackChannel, sender: []const u8) bool {
         return root.isAllowed(self.allowed_users, sender);
+    }
+
+    /// Check if an incoming message should be handled based on the channel policy.
+    /// `sender_id`: the Slack user ID of the message sender.
+    /// `is_dm`: true if the message is a direct message (IM channel).
+    /// `message_text`: the raw message text (used to detect bot mention).
+    /// `bot_user_id`: the bot's own Slack user ID (for mention detection).
+    pub fn shouldHandle(self: *const SlackChannel, sender_id: []const u8, is_dm: bool, message_text: []const u8, bot_user_id: ?[]const u8) bool {
+        const is_mention = if (bot_user_id) |bid| containsMention(message_text, bid) else false;
+        return root.checkPolicy(self.policy, sender_id, is_dm, is_mention);
     }
 
     pub fn healthCheck(_: *SlackChannel) bool {
@@ -132,6 +162,26 @@ pub const SlackChannel = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 };
+
+/// Check if a message text contains a Slack mention of the given user ID.
+/// Slack mentions use the format `<@U12345>`.
+pub fn containsMention(text: []const u8, user_id: []const u8) bool {
+    // Search for "<@USER_ID>" pattern
+    var i: usize = 0;
+    while (i + 3 + user_id.len <= text.len) {
+        if (text[i] == '<' and text[i + 1] == '@') {
+            const start = i + 2;
+            if (start + user_id.len <= text.len and
+                std.mem.eql(u8, text[start .. start + user_id.len], user_id) and
+                start + user_id.len < text.len and text[start + user_id.len] == '>')
+            {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
 
 /// Convert standard Markdown to Slack mrkdwn format.
 ///
@@ -483,4 +533,147 @@ test "slack channel interface returns slack name" {
 
 test "slack channel api base constant" {
     try std.testing.expectEqualStrings("https://slack.com/api", SlackChannel.API_BASE);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// containsMention tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "containsMention detects mention" {
+    try std.testing.expect(containsMention("Hello <@U12345> how are you?", "U12345"));
+}
+
+test "containsMention no mention" {
+    try std.testing.expect(!containsMention("Hello world", "U12345"));
+}
+
+test "containsMention at start" {
+    try std.testing.expect(containsMention("<@UBOT> do something", "UBOT"));
+}
+
+test "containsMention at end" {
+    try std.testing.expect(containsMention("ping <@UBOT>", "UBOT"));
+}
+
+test "containsMention wrong user" {
+    try std.testing.expect(!containsMention("Hey <@UOTHER>", "UBOT"));
+}
+
+test "containsMention empty text" {
+    try std.testing.expect(!containsMention("", "UBOT"));
+}
+
+test "containsMention partial match not detected" {
+    try std.testing.expect(!containsMention("<@UBOT", "UBOT"));
+    try std.testing.expect(!containsMention("@UBOT>", "UBOT"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Per-channel policy integration tests (shouldHandle)
+// ════════════════════════════════════════════════════════════════════════════
+
+test "shouldHandle default policy allows DM" {
+    const allowed = [_][]const u8{};
+    const ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    // Default policy: dm=allow, group=open
+    try std.testing.expect(ch.shouldHandle("U123", true, "hello", null));
+}
+
+test "shouldHandle default policy allows group without mention" {
+    const allowed = [_][]const u8{};
+    const ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    try std.testing.expect(ch.shouldHandle("U123", false, "hello", "UBOT"));
+}
+
+test "shouldHandle mention_only group requires mention" {
+    const allowed = [_][]const u8{};
+    const ch = SlackChannel.initWithPolicy(
+        std.testing.allocator,
+        "tok",
+        null,
+        null,
+        &allowed,
+        .{ .group = .mention_only },
+    );
+    try std.testing.expect(!ch.shouldHandle("U123", false, "hello", "UBOT"));
+    try std.testing.expect(ch.shouldHandle("U123", false, "hey <@UBOT> help", "UBOT"));
+}
+
+test "shouldHandle deny dm blocks all DMs" {
+    const allowed = [_][]const u8{};
+    const ch = SlackChannel.initWithPolicy(
+        std.testing.allocator,
+        "tok",
+        null,
+        null,
+        &allowed,
+        .{ .dm = .deny },
+    );
+    try std.testing.expect(!ch.shouldHandle("U123", true, "hello", null));
+    try std.testing.expect(!ch.shouldHandle("U456", true, "hi", "UBOT"));
+}
+
+test "shouldHandle dm allowlist permits listed users" {
+    const allowed = [_][]const u8{};
+    const list = [_][]const u8{ "alice", "bob" };
+    const ch = SlackChannel.initWithPolicy(
+        std.testing.allocator,
+        "tok",
+        null,
+        null,
+        &allowed,
+        .{ .dm = .allowlist, .allowlist = &list },
+    );
+    try std.testing.expect(ch.shouldHandle("alice", true, "hi", null));
+    try std.testing.expect(ch.shouldHandle("bob", true, "hi", null));
+    try std.testing.expect(!ch.shouldHandle("eve", true, "hi", null));
+}
+
+test "shouldHandle group allowlist permits listed users" {
+    const allowed = [_][]const u8{};
+    const list = [_][]const u8{"trusted"};
+    const ch = SlackChannel.initWithPolicy(
+        std.testing.allocator,
+        "tok",
+        null,
+        null,
+        &allowed,
+        .{ .group = .allowlist, .allowlist = &list },
+    );
+    try std.testing.expect(ch.shouldHandle("trusted", false, "msg", "UBOT"));
+    try std.testing.expect(!ch.shouldHandle("stranger", false, "msg", "UBOT"));
+}
+
+test "shouldHandle mention_only without bot_user_id treats as no mention" {
+    const allowed = [_][]const u8{};
+    const ch = SlackChannel.initWithPolicy(
+        std.testing.allocator,
+        "tok",
+        null,
+        null,
+        &allowed,
+        .{ .group = .mention_only },
+    );
+    // No bot_user_id means mention cannot be detected
+    try std.testing.expect(!ch.shouldHandle("U123", false, "hey <@UBOT> help", null));
+}
+
+test "initWithPolicy sets policy correctly" {
+    const allowed = [_][]const u8{};
+    const list = [_][]const u8{"admin"};
+    const ch = SlackChannel.initWithPolicy(
+        std.testing.allocator,
+        "tok",
+        "xapp-test",
+        "C999",
+        &allowed,
+        .{ .dm = .deny, .group = .allowlist, .allowlist = &list },
+    );
+    try std.testing.expect(ch.policy.dm == .deny);
+    try std.testing.expect(ch.policy.group == .allowlist);
+    try std.testing.expectEqual(@as(usize, 1), ch.policy.allowlist.len);
+    try std.testing.expectEqualStrings("admin", ch.policy.allowlist[0]);
+    try std.testing.expectEqualStrings("tok", ch.bot_token);
+    try std.testing.expectEqualStrings("xapp-test", ch.app_token.?);
+    try std.testing.expectEqualStrings("C999", ch.channel_id.?);
 }

@@ -1,0 +1,466 @@
+//! Voice transcription via Groq Whisper API (OpenAI-compatible).
+//!
+//! Reads an audio file, builds a multipart/form-data POST request,
+//! and sends it to the Groq transcription endpoint. Returns the
+//! transcribed text as an owned slice.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const root = @import("root.zig");
+
+const log = std.log.scoped(.voice);
+
+fn getPid() i32 {
+    if (builtin.os.tag == .linux) return @intCast(std.os.linux.getpid());
+    if (builtin.os.tag == .macos) return std.c.getpid();
+    return 0;
+}
+
+pub const TranscribeOptions = struct {
+    model: []const u8 = "whisper-large-v3",
+    language: ?[]const u8 = null,
+};
+
+pub const TranscribeError = error{
+    FileReadFailed,
+    BoundaryGenerationFailed,
+    ApiRequestFailed,
+    InvalidResponse,
+} || std.mem.Allocator.Error;
+
+/// Transcribe an audio file using the Groq Whisper API.
+///
+/// Reads the file at `file_path`, builds a multipart/form-data request,
+/// POSTs to the Groq transcription endpoint, and returns the transcribed text.
+/// Caller owns the returned slice.
+pub fn transcribeFile(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    file_path: []const u8,
+    opts: TranscribeOptions,
+) TranscribeError![]const u8 {
+    // Read audio file
+    const file_data = readFileData(allocator, file_path) catch return error.FileReadFailed;
+    defer allocator.free(file_data);
+
+    // Generate random boundary (16 hex chars)
+    const boundary = generateBoundary() catch return error.BoundaryGenerationFailed;
+
+    // Build multipart body
+    const body = buildMultipartBody(allocator, &boundary, file_data, opts) catch return error.OutOfMemory;
+    defer allocator.free(body);
+
+    // Build headers
+    var content_type_buf: [128]u8 = undefined;
+    var ct_fbs = std.io.fixedBufferStream(&content_type_buf);
+    ct_fbs.writer().print("Content-Type: multipart/form-data; boundary={s}", .{&boundary}) catch
+        return error.BoundaryGenerationFailed;
+    const content_type_hdr = ct_fbs.getWritten();
+
+    var auth_buf: [256]u8 = undefined;
+    var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+    auth_fbs.writer().print("Authorization: Bearer {s}", .{api_key}) catch
+        return error.ApiRequestFailed;
+    const auth_hdr = auth_fbs.getWritten();
+
+    // POST via curl (using curlPostRaw for multipart — no default Content-Type)
+    const resp = curlPostMultipart(
+        allocator,
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        body,
+        &.{ auth_hdr, content_type_hdr },
+    ) catch return error.ApiRequestFailed;
+    defer allocator.free(resp);
+
+    // Parse {"text":"..."} from response
+    return parseTranscriptionText(allocator, resp) catch return error.InvalidResponse;
+}
+
+/// Read entire file into memory (max 50 MB).
+fn readFileData(allocator: std.mem.Allocator, file_path: []const u8) ![]u8 {
+    const file = try std.fs.openFileAbsolute(file_path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(allocator, 50 * 1024 * 1024);
+}
+
+/// Generate a random 32-character hex boundary string.
+fn generateBoundary() ![32]u8 {
+    var random_bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    var boundary: [32]u8 = undefined;
+    const hex = "0123456789abcdef";
+    for (random_bytes, 0..) |b, i| {
+        boundary[i * 2] = hex[b >> 4];
+        boundary[i * 2 + 1] = hex[b & 0x0f];
+    }
+    return boundary;
+}
+
+/// Build the multipart/form-data body.
+fn buildMultipartBody(
+    allocator: std.mem.Allocator,
+    boundary: []const u8,
+    file_data: []const u8,
+    opts: TranscribeOptions,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    // Part: file
+    try body.appendSlice(allocator, "--");
+    try body.appendSlice(allocator, boundary);
+    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n");
+    try body.appendSlice(allocator, file_data);
+    try body.appendSlice(allocator, "\r\n");
+
+    // Part: model
+    try body.appendSlice(allocator, "--");
+    try body.appendSlice(allocator, boundary);
+    try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n");
+    try body.appendSlice(allocator, opts.model);
+    try body.appendSlice(allocator, "\r\n");
+
+    // Part: language (optional)
+    if (opts.language) |lang| {
+        try body.appendSlice(allocator, "--");
+        try body.appendSlice(allocator, boundary);
+        try body.appendSlice(allocator, "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n");
+        try body.appendSlice(allocator, lang);
+        try body.appendSlice(allocator, "\r\n");
+    }
+
+    // Closing boundary
+    try body.appendSlice(allocator, "--");
+    try body.appendSlice(allocator, boundary);
+    try body.appendSlice(allocator, "--\r\n");
+
+    return body.toOwnedSlice(allocator);
+}
+
+/// Parse the "text" field from a JSON response like {"text":"transcribed text here"}.
+fn parseTranscriptionText(allocator: std.mem.Allocator, json_resp: []const u8) ![]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_resp, .{}) catch
+        return error.InvalidResponse;
+    defer parsed.deinit();
+
+    const text_val = parsed.value.object.get("text") orelse return error.InvalidResponse;
+    if (text_val != .string) return error.InvalidResponse;
+    return try allocator.dupe(u8, text_val.string);
+}
+
+/// HTTP POST via curl subprocess without default Content-Type header.
+/// Used for multipart/form-data where Content-Type includes boundary.
+fn curlPostMultipart(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) ![]u8 {
+    // Write body to a temp file to avoid argv size limits with binary data.
+    // Use --data-binary @file instead of -d.
+    var tmp_path_buf: [256]u8 = undefined;
+    var tmp_fbs = std.io.fixedBufferStream(&tmp_path_buf);
+    const pid = getPid();
+    try tmp_fbs.writer().print("/tmp/nullclaw_voice_{d}.bin", .{pid});
+    const tmp_path_slice = tmp_fbs.getWritten();
+
+    // Null-terminate for the OS
+    var tmp_path_z: [256]u8 = undefined;
+    @memcpy(tmp_path_z[0..tmp_path_slice.len], tmp_path_slice);
+    tmp_path_z[tmp_path_slice.len] = 0;
+    const tmp_path_sentinel: [:0]const u8 = tmp_path_z[0..tmp_path_slice.len :0];
+
+    // Write body to temp file
+    {
+        const tmp_file = try std.fs.createFileAbsolute(tmp_path_sentinel, .{});
+        defer tmp_file.close();
+        try tmp_file.writeAll(body);
+    }
+    defer std.fs.deleteFileAbsolute(tmp_path_sentinel) catch {};
+
+    // Build data-binary arg: @/tmp/...
+    var data_arg_buf: [300]u8 = undefined;
+    var data_fbs = std.io.fixedBufferStream(&data_arg_buf);
+    try data_fbs.writer().print("@{s}", .{tmp_path_slice});
+    const data_arg = data_fbs.getWritten();
+
+    var argv_buf: [32][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-s";
+    argc += 1;
+    argv_buf[argc] = "-X";
+    argc += 1;
+    argv_buf[argc] = "POST";
+    argc += 1;
+
+    for (headers) |hdr| {
+        if (argc + 2 > argv_buf.len) break;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = hdr;
+        argc += 1;
+    }
+
+    argv_buf[argc] = "--data-binary";
+    argc += 1;
+    argv_buf[argc] = data_arg;
+    argc += 1;
+    argv_buf[argc] = url;
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
+
+    const term = child.wait() catch return error.CurlWaitError;
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
+        else => {
+            allocator.free(stdout);
+            return error.CurlFailed;
+        },
+    }
+
+    return stdout;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Telegram Voice Integration
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Download a Telegram voice/audio file and transcribe it.
+/// Returns the transcribed text, or null if transcription is unavailable
+/// (no GROQ_API_KEY or file download fails).
+pub fn transcribeTelegramVoice(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    file_id: []const u8,
+) ?[]const u8 {
+    // Check for GROQ_API_KEY
+    const api_key = std.posix.getenv("GROQ_API_KEY") orelse return null;
+
+    // 1. Call getFile to get file_path
+    const tg_file_path = getFilePath(allocator, bot_token, file_id) catch |err| {
+        log.err("getFile failed: {}", .{err});
+        return null;
+    };
+    defer allocator.free(tg_file_path);
+
+    // 2. Download file via Telegram API
+    const local_path = downloadTelegramFile(allocator, bot_token, tg_file_path) catch |err| {
+        log.err("download failed: {}", .{err});
+        return null;
+    };
+    defer {
+        // Clean up temp file
+        std.fs.deleteFileAbsolute(local_path) catch {};
+        allocator.free(local_path);
+    }
+
+    // 3. Transcribe
+    const text = transcribeFile(allocator, api_key, local_path, .{}) catch |err| {
+        log.err("transcription failed: {}", .{err});
+        return null;
+    };
+
+    return text;
+}
+
+/// Call Telegram getFile API and extract the file_path from the response.
+fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8) ![]u8 {
+    var url_buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&url_buf);
+    try fbs.writer().print("https://api.telegram.org/bot{s}/getFile", .{bot_token});
+    const url = fbs.getWritten();
+
+    // Build request body
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_list.deinit(allocator);
+    try body_list.appendSlice(allocator, "{\"file_id\":");
+    try root.json_util.appendJsonString(&body_list, allocator, file_id);
+    try body_list.appendSlice(allocator, "}");
+
+    const resp = try root.http_util.curlPost(allocator, url, body_list.items, &.{});
+    defer allocator.free(resp);
+
+    // Parse response
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
+        return error.InvalidResponse;
+    defer parsed.deinit();
+
+    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
+    const fp_val = result.object.get("file_path") orelse return error.InvalidResponse;
+    if (fp_val != .string) return error.InvalidResponse;
+    return try allocator.dupe(u8, fp_val.string);
+}
+
+/// Download a file from Telegram and save to /tmp. Returns the local path (owned).
+fn downloadTelegramFile(allocator: std.mem.Allocator, bot_token: []const u8, tg_file_path: []const u8) ![]u8 {
+    var url_buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&url_buf);
+    try fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path });
+    const url = fbs.getWritten();
+
+    const data = try root.http_util.curlGet(allocator, url, &.{}, "30");
+    defer allocator.free(data);
+
+    // Save to temp file
+    const pid = getPid();
+    var path_buf: [256]u8 = undefined;
+    var path_fbs = std.io.fixedBufferStream(&path_buf);
+    try path_fbs.writer().print("/tmp/nullclaw_tg_voice_{d}.ogg", .{pid});
+    const local_path = path_fbs.getWritten();
+
+    var z_buf: [256]u8 = undefined;
+    @memcpy(z_buf[0..local_path.len], local_path);
+    z_buf[local_path.len] = 0;
+    const local_path_z: [:0]const u8 = z_buf[0..local_path.len :0];
+
+    {
+        const f = try std.fs.createFileAbsolute(local_path_z, .{});
+        defer f.close();
+        try f.writeAll(data);
+    }
+
+    return try allocator.dupe(u8, local_path);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "voice TranscribeOptions defaults" {
+    const opts = TranscribeOptions{};
+    try std.testing.expectEqualStrings("whisper-large-v3", opts.model);
+    try std.testing.expect(opts.language == null);
+}
+
+test "voice TranscribeOptions custom" {
+    const opts = TranscribeOptions{
+        .model = "whisper-large-v3-turbo",
+        .language = "ru",
+    };
+    try std.testing.expectEqualStrings("whisper-large-v3-turbo", opts.model);
+    try std.testing.expectEqualStrings("ru", opts.language.?);
+}
+
+test "voice generateBoundary produces 32 hex chars" {
+    const boundary = try generateBoundary();
+    try std.testing.expectEqual(@as(usize, 32), boundary.len);
+    for (&boundary) |c| {
+        try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
+}
+
+test "voice generateBoundary produces different values" {
+    const b1 = try generateBoundary();
+    const b2 = try generateBoundary();
+    // Extremely unlikely to be equal
+    try std.testing.expect(!std.mem.eql(u8, &b1, &b2));
+}
+
+test "voice buildMultipartBody structure" {
+    const allocator = std.testing.allocator;
+    const boundary = "abcdef0123456789abcdef0123456789";
+    const file_data = "fake audio data";
+
+    const body = try buildMultipartBody(allocator, boundary, file_data, .{});
+    defer allocator.free(body);
+
+    // Check that boundary markers appear
+    try std.testing.expect(std.mem.indexOf(u8, body, "--abcdef0123456789abcdef0123456789") != null);
+    // Check file part
+    try std.testing.expect(std.mem.indexOf(u8, body, "name=\"file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "filename=\"audio.ogg\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Content-Type: audio/ogg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "fake audio data") != null);
+    // Check model part
+    try std.testing.expect(std.mem.indexOf(u8, body, "name=\"model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "whisper-large-v3") != null);
+    // Check closing boundary
+    try std.testing.expect(std.mem.indexOf(u8, body, "--abcdef0123456789abcdef0123456789--") != null);
+}
+
+test "voice buildMultipartBody with language" {
+    const allocator = std.testing.allocator;
+    const boundary = "abcdef0123456789abcdef0123456789";
+
+    const body = try buildMultipartBody(allocator, boundary, "data", .{ .language = "en" });
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "name=\"language\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "en") != null);
+}
+
+test "voice buildMultipartBody without language" {
+    const allocator = std.testing.allocator;
+    const boundary = "abcdef0123456789abcdef0123456789";
+
+    const body = try buildMultipartBody(allocator, boundary, "data", .{});
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "name=\"language\"") == null);
+}
+
+test "voice parseTranscriptionText valid" {
+    const allocator = std.testing.allocator;
+    const json = "{\"text\":\"Hello, world!\"}";
+    const text = try parseTranscriptionText(allocator, json);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("Hello, world!", text);
+}
+
+test "voice parseTranscriptionText unicode" {
+    const allocator = std.testing.allocator;
+    const json = "{\"text\":\"Привет мир\"}";
+    const text = try parseTranscriptionText(allocator, json);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("Привет мир", text);
+}
+
+test "voice parseTranscriptionText missing field" {
+    const allocator = std.testing.allocator;
+    const result = parseTranscriptionText(allocator, "{\"status\":\"ok\"}");
+    try std.testing.expectError(error.InvalidResponse, result);
+}
+
+test "voice parseTranscriptionText invalid json" {
+    const allocator = std.testing.allocator;
+    const result = parseTranscriptionText(allocator, "not json");
+    try std.testing.expectError(error.InvalidResponse, result);
+}
+
+test "voice parseTranscriptionText non-string text" {
+    const allocator = std.testing.allocator;
+    const result = parseTranscriptionText(allocator, "{\"text\":42}");
+    try std.testing.expectError(error.InvalidResponse, result);
+}
+
+test "voice parseTranscriptionText empty text" {
+    const allocator = std.testing.allocator;
+    const text = try parseTranscriptionText(allocator, "{\"text\":\"\"}");
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
+}
+
+test "voice transcribeFile returns error for nonexistent file" {
+    const allocator = std.testing.allocator;
+    const result = transcribeFile(allocator, "fake_key", "/nonexistent/path/audio.ogg", .{});
+    try std.testing.expectError(error.FileReadFailed, result);
+}
+
+test "voice transcribeTelegramVoice returns null without GROQ_API_KEY" {
+    // GROQ_API_KEY is not set in test env, so should return null
+    const result = transcribeTelegramVoice(std.testing.allocator, "fake:token", "fake_file_id");
+    try std.testing.expect(result == null);
+}

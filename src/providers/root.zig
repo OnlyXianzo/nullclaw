@@ -13,6 +13,7 @@ pub const reliable = @import("reliable.zig");
 pub const router = @import("router.zig");
 pub const sse = @import("sse.zig");
 pub const claude_cli = @import("claude_cli.zig");
+pub const codex_cli = @import("codex_cli.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
 // Core Types

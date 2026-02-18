@@ -1055,6 +1055,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
+    if (repl_history.items.len > 0) {
+        try w.print("[History: {d} entries loaded]\n", .{repl_history.items.len});
+        try w.flush();
+    }
+
     var agent = try Agent.fromConfig(allocator, &cfg, provider_i, tools, mem_opt, obs);
     defer agent.deinit();
 

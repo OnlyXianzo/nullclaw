@@ -131,6 +131,8 @@ pub const SlackConfig = struct {
     app_token: ?[]const u8 = null,
     channel_id: ?[]const u8 = null,
     allowed_users: []const []const u8 = &.{},
+    dm_policy: []const u8 = "allow",
+    group_policy: []const u8 = "mention_only",
 };
 
 pub const WebhookConfig = struct {

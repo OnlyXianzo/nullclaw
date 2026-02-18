@@ -471,6 +471,8 @@ pub const TelegramChannel = struct {
 
     /// Poll for updates using long-polling (getUpdates) via curl.
     /// Returns a slice of ChannelMessages allocated on the given allocator.
+    /// Voice and audio messages are automatically transcribed via Groq Whisper
+    /// when GROQ_API_KEY is set.
     pub fn pollUpdates(self: *TelegramChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, "getUpdates");
@@ -501,8 +503,6 @@ pub const TelegramChannel = struct {
             }
 
             const message = update.object.get("message") orelse continue;
-            const text_val = (message.object.get("text")) orelse continue;
-            const text_str = if (text_val == .string) text_val.string else continue;
 
             // Get sender info
             const from_obj = message.object.get("from") orelse continue;
@@ -523,10 +523,40 @@ pub const TelegramChannel = struct {
                 continue;
             };
 
+            // Check for voice/audio messages and attempt transcription
+            const content = blk_content: {
+                const voice_obj = message.object.get("voice") orelse message.object.get("audio");
+                if (voice_obj) |vobj| {
+                    const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
+                    const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
+
+                    if (root.voice.transcribeTelegramVoice(allocator, self.bot_token, file_id)) |transcribed| {
+                        // Prepend [Voice]: prefix
+                        var result: std.ArrayListUnmanaged(u8) = .empty;
+                        result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;
+                        result.appendSlice(allocator, transcribed) catch {
+                            result.deinit(allocator);
+                            break :blk_content null;
+                        };
+                        allocator.free(transcribed);
+                        break :blk_content result.toOwnedSlice(allocator) catch null;
+                    }
+                    break :blk_content null;
+                }
+                break :blk_content null;
+            };
+
+            // Fall back to text content if no voice transcription
+            const final_content = content orelse blk_text: {
+                const text_val = message.object.get("text") orelse continue;
+                const text_str = if (text_val == .string) text_val.string else continue;
+                break :blk_text try allocator.dupe(u8, text_str);
+            };
+
             try messages.append(allocator, .{
                 .id = try allocator.dupe(u8, username),
                 .sender = try allocator.dupe(u8, chat_id_str),
-                .content = try allocator.dupe(u8, text_str),
+                .content = final_content,
                 .channel = "telegram",
                 .timestamp = root.nowEpochSecs(),
             });

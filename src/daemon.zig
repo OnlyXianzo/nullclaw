@@ -623,7 +623,13 @@ test "writeStateFile produces valid content" {
     state.addComponent("test-comp");
 
     // Write to a temp path
-    const path = "/tmp/nullclaw-test-daemon-state.json";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "daemon_state.json" });
+    defer std.testing.allocator.free(path);
+
     try writeStateFile(std.testing.allocator, path, &state);
 
     // Read back and verify
@@ -635,7 +641,4 @@ test "writeStateFile produces valid content" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"status\": \"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "test-comp") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "127.0.0.1:8080") != null);
-
-    // Cleanup
-    std.fs.deleteFileAbsolute(path) catch {};
 }

@@ -26,10 +26,12 @@ pub const SYSTEM_BLOCKED_PREFIXES = [_][]const u8{
     "/sys",
 };
 
-/// Check whether a directory-style prefix matches (exact or followed by '/').
+/// Check whether a directory-style prefix matches (exact or followed by a path separator).
 fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
     if (!std.mem.startsWith(u8, path, prefix)) return false;
-    return path.len == prefix.len or path[prefix.len] == '/';
+    if (path.len == prefix.len) return true;
+    const c = path[prefix.len];
+    return c == '/' or c == '\\';
 }
 
 /// Check whether a **resolved** absolute path is allowed by the policy:
@@ -107,7 +109,7 @@ pub const FileEditTool = struct {
             return ToolResult.fail("Missing 'new_text' parameter");
 
         // Build full path — absolute or relative
-        const full_path = if (path.len > 0 and path[0] == '/') blk: {
+        const full_path = if (std.fs.path.isAbsolute(path)) blk: {
             if (self.allowed_paths.len == 0)
                 return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
             if (std.mem.indexOfScalar(u8, path, 0) != null)
@@ -183,9 +185,9 @@ pub const FileEditTool = struct {
 
 /// Check if a relative path is safe (no traversal, no absolute path).
 pub fn isPathSafe(path: []const u8) bool {
-    if (path.len > 0 and path[0] == '/') return false;
+    if (std.fs.path.isAbsolute(path)) return false;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    var iter = std.mem.splitScalar(u8, path, '/');
+    var iter = std.mem.splitAny(u8, path, "/\\");
     while (iter.next()) |component| {
         if (std.mem.eql(u8, component, "..")) return false;
     }

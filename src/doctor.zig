@@ -792,21 +792,27 @@ test "checkDaemonState parses valid JSON state" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
     const state_content =
         \\{"status": "running", "updated_at": 9999999999, "components": {"scheduler": {"status": "ok"}, "channel:telegram": {"status": "ok"}}}
     ;
-    const state_dir = "/tmp/nullclaw-doctor-test-dir";
-    std.fs.makeDirAbsolute(state_dir) catch {};
-    const state_path = "/tmp/nullclaw-doctor-test-dir/daemon_state.json";
-    const file = try std.fs.createFileAbsolute(state_path, .{});
-    try file.writeAll(state_content);
-    file.close();
-    defer std.fs.deleteFileAbsolute(state_path) catch {};
+    {
+        const file = try tmp.dir.createFile("daemon_state.json", .{});
+        try file.writeAll(state_content);
+        file.close();
+    }
+
+    const cfg_path = try std.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
+    defer std.testing.allocator.free(cfg_path);
 
     var items: std.ArrayList(DiagItem) = .empty;
 
     var cfg = testConfig();
-    cfg.config_path = "/tmp/nullclaw-doctor-test-dir/config.json";
+    cfg.config_path = cfg_path;
 
     try checkDaemonState(allocator, &cfg, &items);
 

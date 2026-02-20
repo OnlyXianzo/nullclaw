@@ -446,7 +446,8 @@ fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
     if (!std.mem.eql(u8, path[0..prefix.len], prefix)) return false;
     // Must match at component boundary
     if (path.len == prefix.len) return true;
-    return path[prefix.len] == '/';
+    const c = path[prefix.len];
+    return c == '/' or c == '\\';
 }
 
 /// Check for dangerous arguments that allow sub-command execution.

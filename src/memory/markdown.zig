@@ -424,7 +424,12 @@ test "markdown parseEntries preserves category" {
 }
 
 test "markdown accepts session_id param" {
-    var mem = try MarkdownMemory.init(std.testing.allocator, "/tmp/nullclaw-test-md-session");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
     defer mem.deinit();
     const m = mem.memory();
 

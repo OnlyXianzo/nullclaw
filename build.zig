@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const sqlite3 = sqlite3_dep.artifact("sqlite3");
+    sqlite3.root_module.addCMacro("SQLITE_ENABLE_FTS5", "1");
 
     // ---------- library module (importable by consumers) ----------
     const lib_mod = b.addModule("nullclaw", .{

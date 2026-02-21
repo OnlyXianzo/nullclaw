@@ -1,0 +1,64 @@
+name: Build Windows (No-AVX)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'ReleaseSmall'
+        type: choice
+        options:
+          - ReleaseSmall
+          - ReleaseSafe
+          - ReleaseFast
+          - Debug
+
+jobs:
+  build-windows-noavx:
+    name: Build Windows No-AVX
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait before setup
+        run: sleep 5
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Wait after Zig installation
+        run: sleep 3
+
+      - name: Display Zig version
+        run: |
+          zig version
+          sleep 2
+
+      - name: Build Windows executable (No-AVX / Baseline CPU)
+        run: |
+          echo "Building nullclaw for Windows without AVX support..."
+          sleep 2
+          zig build -Doptimize=${{ github.event.inputs.build_type || 'ReleaseSmall' }} -Dtarget=x86_64-windows -Dcpu=baseline
+          sleep 3
+
+      - name: Verify executable exists
+        run: |
+          ls -la zig-out/bin/
+          sleep 2
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nullclaw-windows-x86_64-noavx
+          path: zig-out/bin/nullclaw.exe
+
+      - name: Final wait
+        run: sleep 2
